@@ -20,28 +20,38 @@ class UpstreamError(Exception):
     pass
 
 
-def validate_init_data(raw):
+INIT_DATA_TTL = 86400
+
+
+def check_init_data(raw):
+    """Return ('ok', (user, start_param)), ('expired', None) or ('invalid', None)."""
     if not config.BOT_TOKEN or not raw or len(raw) > 12000:
-        return None
+        return 'invalid', None
     try:
         pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=24)
         fields = dict(pairs)
         signature = fields.pop('hash', '')
         if len(pairs) != len(fields) + 1 or not re.fullmatch(r'[a-f0-9]{64}', signature):
-            return None
+            return 'invalid', None
         message = '\n'.join(f'{key}={fields[key]}' for key in sorted(fields)).encode()
         secret = hmac.digest(b'WebAppData', config.BOT_TOKEN.encode(), 'sha256')
         if not hmac.compare_digest(hmac.new(secret, message, hashlib.sha256).hexdigest(), signature):
-            return None
+            return 'invalid', None
         age = time.time() - int(fields['auth_date'])
-        if not -60 <= age <= 86400:
-            return None
+        if age > INIT_DATA_TTL:
+            return 'expired', None
+        if age < -60:
+            return 'invalid', None
         user = json.loads(fields['user'])
         if not isinstance(user['id'], int) or not 0 < user['id'] < 2**52:
-            return None
-        return user, fields.get('start_param', '')
+            return 'invalid', None
+        return 'ok', (user, fields.get('start_param', ''))
     except (KeyError, TypeError, ValueError):
-        return None
+        return 'invalid', None
+
+
+def validate_init_data(raw):
+    return check_init_data(raw)[1]
 
 
 def compact_json(data):
@@ -52,14 +62,40 @@ def crypto_sign(data):
     return hmac.new(config.PAY2328_API_KEY.encode(), base64.b64encode(data), hashlib.sha256).hexdigest()
 
 
-def valid_crypto_webhook(payload):
+SIGN_MEMBER = re.compile(rb'"sign"\s*:\s*"[a-f0-9]{64}"')
+
+
+def webhook_bodies(payload, raw):
+    """Serialisations of the notification that the provider may have signed.
+
+    Re-encoding parsed JSON can change number formatting and escaping, so the
+    original bytes are tried first and the re-encoded forms cover providers that
+    sign the document before adding the signature field.
+    """
+    data = {key: value for key, value in payload.items() if key != 'sign'}
+    bodies = []
+    if raw:
+        bodies.append(raw)
+        for pattern in (rb',\s*' + SIGN_MEMBER.pattern, SIGN_MEMBER.pattern + rb'\s*,', SIGN_MEMBER.pattern):
+            stripped, count = re.subn(pattern, b'', raw, count=1)
+            if count:
+                bodies.append(stripped)
+                break
+    for ascii_only in (False, True):
+        encoded = json.dumps(data, ensure_ascii=ascii_only, separators=(',', ':')).encode()
+        bodies += [encoded, encoded.replace(b'/', b'\\/')]
+    return list(dict.fromkeys(bodies))
+
+
+def valid_crypto_webhook(payload, raw=b'', header_signature=''):
     if not config.PAY2328_API_KEY or not isinstance(payload, dict):
         return False
-    signature = payload.get('sign')
-    if not isinstance(signature, str) or not re.fullmatch(r'[a-f0-9]{64}', signature):
+    signatures = [value.lower() for value in (payload.get('sign'), header_signature)
+                  if isinstance(value, str) and re.fullmatch(r'[a-fA-F0-9]{64}', value)]
+    if not signatures:
         return False
-    data = {key: value for key, value in payload.items() if key != 'sign'}
-    return hmac.compare_digest(signature, crypto_sign(compact_json(data)))
+    expected = [crypto_sign(body) for body in webhook_bodies(payload, raw)]
+    return any(hmac.compare_digest(signature, candidate) for signature in signatures for candidate in expected)
 
 
 def rub_minor(value):
@@ -161,6 +197,33 @@ class Integrations:
         if result.get('order_id') != order['ref'] or not update_crypto(self.store, result):
             raise UpstreamError('2328.io: payment does not match order')
         return self.store.order(order['id'], order['user_id'])
+
+    async def reconcile_payments(self, interval=30, clock=time.monotonic):
+        """Confirm crypto payments from the provider when a webhook is lost or rejected."""
+        schedule = {}
+        while True:
+            try:
+                now = clock()
+                orders = self.store.open_crypto_orders()
+                open_ids = {order['id'] for order in orders}
+                for order_id in list(schedule):
+                    if order_id not in open_ids:
+                        del schedule[order_id]
+                for order in orders:
+                    attempts, due = schedule.get(order['id'], (0, now + 60))
+                    if due > now:
+                        schedule.setdefault(order['id'], (attempts, due))
+                        continue
+                    schedule[order['id']] = (attempts + 1, now + min(1800, 60 * 2 ** min(attempts, 5)))
+                    try:
+                        await self.refresh_crypto(order)
+                    except UpstreamError:
+                        log.warning('Не удалось сверить криптосчёт заказа %s', order['id'])
+            except sqlite3.OperationalError:
+                log.exception('Сверка криптоплатежей временно недоступна')
+            except Exception as exc:
+                log.warning('Ошибка сверки криптоплатежей: %s', type(exc).__name__)
+            await asyncio.sleep(interval)
 
     async def send_message(self, chat_id, text, button=None):
         data = {'chat_id': chat_id, 'text': text}

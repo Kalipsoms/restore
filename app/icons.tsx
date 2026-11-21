@@ -47,5 +47,7 @@ export function Icon({ name, size = 24, className }: { name: IconName; size?: nu
 }
 
 export function Brand({ className = '' }: { className?: string }) {
-  return <span className={`brand ${className}`}><img src="/restore.svg" width="26" height="26" alt=""/><span>ReStore</span></span>;
+  return <span className={`brand ${className}`}><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
+    <path fill="currentColor" d="M4.5 28V4h12.3C23.4 4 27.5 7.8 27.5 13c0 4.4-2.9 7.5-7.4 8.5L26 28h-7.2L9.9 18h6.7c3.4 0 5.1-1.7 5.1-4.1s-1.7-4-5.1-4h-6.5V28z"/>
+  </svg><span>ReStore</span></span>;
 }

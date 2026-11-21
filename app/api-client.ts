@@ -31,8 +31,15 @@ type TelegramApp = {
   expand?: () => void;
   requestFullscreen?: () => void;
   exitFullscreen?: () => void;
-  onEvent?: (event: 'fullscreenFailed', handler: () => void) => void;
-  offEvent?: (event: 'fullscreenFailed', handler: () => void) => void;
+  onEvent?: (event: 'fullscreenFailed' | 'themeChanged', handler: () => void) => void;
+  offEvent?: (event: 'fullscreenFailed' | 'themeChanged', handler: () => void) => void;
+  colorScheme?: 'light' | 'dark';
+  close?: () => void;
+  enableClosingConfirmation?: () => void;
+  disableClosingConfirmation?: () => void;
+  disableVerticalSwipes?: () => void;
+  enableVerticalSwipes?: () => void;
+  BackButton?: { show?: () => void; hide?: () => void; onClick?: (handler: () => void) => void };
   setHeaderColor?: (color: string) => void;
   setBackgroundColor?: (color: string) => void;
   setBottomBarColor?: (color: string) => void;
@@ -45,19 +52,78 @@ export function telegram() {
   if (typeof window !== 'undefined') return (window as Window & { Telegram?: { WebApp?: TelegramApp } }).Telegram?.WebApp;
 }
 
+const themeBackground = { dark: '#101017', light: '#f5f3fa' };
+
+function applyTheme() {
+  const webApp = telegram();
+  if (!webApp?.initData) return;
+  const theme = webApp.colorScheme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = theme;
+  try {
+    webApp.setHeaderColor?.(themeBackground[theme]);
+    webApp.setBackgroundColor?.(themeBackground[theme]);
+    webApp.setBottomBarColor?.(themeBackground[theme]);
+  } catch {
+    // Older clients may only offer theme colors.
+  }
+}
+
+let telegramReady = false;
+
 export function initTelegram() {
   const webApp = telegram();
   webApp?.ready?.();
-  if (webApp?.initData) {
-    webApp.expand?.();
-    try {
-      webApp.setHeaderColor?.('#101017');
-      webApp.setBackgroundColor?.('#101017');
-      webApp.setBottomBarColor?.('#101017');
-    } catch {
-      // Older clients may only offer theme colors.
-    }
+  if (!webApp?.initData) return;
+  webApp.expand?.();
+  applyTheme();
+  if (!telegramReady) webApp.onEvent?.('themeChanged', applyTheme);
+  telegramReady = true;
+}
+
+function supports(version: string) {
+  const webApp = telegram();
+  return !!webApp?.initData && webApp.isVersionAtLeast?.(version) !== false;
+}
+
+// Telegram's native back button. The most recently registered handler receives the press.
+const backHandlers: (() => void)[] = [];
+let backBound = false;
+
+function syncBackButton() {
+  const button = supports('6.1') ? telegram()?.BackButton : undefined;
+  if (!button) return;
+  if (!backBound) {
+    button.onClick?.(() => backHandlers.at(-1)?.());
+    backBound = true;
   }
+  if (backHandlers.length) button.show?.();
+  else button.hide?.();
+}
+
+export function registerBack(handler: () => void) {
+  backHandlers.push(handler);
+  syncBackButton();
+  return () => {
+    const index = backHandlers.lastIndexOf(handler);
+    if (index >= 0) backHandlers.splice(index, 1);
+    syncBackButton();
+  };
+}
+
+// Counters let nested screens request the same protection without undoing each other.
+let swipeLocks = 0;
+let closeGuards = 0;
+
+export function lockSwipes() {
+  if (!supports('7.7')) return () => {};
+  if (swipeLocks++ === 0) telegram()?.disableVerticalSwipes?.();
+  return () => { if (--swipeLocks === 0) telegram()?.enableVerticalSwipes?.(); };
+}
+
+export function guardClosing() {
+  if (!supports('6.2')) return () => {};
+  if (closeGuards++ === 0) telegram()?.enableClosingConfirmation?.();
+  return () => { if (--closeGuards === 0) telegram()?.disableClosingConfirmation?.(); };
 }
 
 function isDesktopTelegram(platform: string) {
@@ -93,9 +159,18 @@ export function expandDesktopAdmin() {
 }
 
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string, readonly botUrl = '') {
+  constructor(readonly status: number, message: string, readonly botUrl = '', readonly expired = false) {
     super(message);
   }
+}
+
+const unauthorizedEvent = 'restore:unauthorized';
+
+/** Calls the listener when any request is rejected because the Telegram session is no longer valid. */
+export function onUnauthorized(listener: (error: ApiError) => void) {
+  const handle = (event: Event) => listener((event as CustomEvent<ApiError>).detail);
+  window.addEventListener(unauthorizedEvent, handle);
+  return () => window.removeEventListener(unauthorizedEvent, handle);
 }
 
 export function apiRequest(path: string, options: RequestInit = {}) {
@@ -103,7 +178,7 @@ export function apiRequest(path: string, options: RequestInit = {}) {
   const initData = telegram()?.initData;
   if (initData) headers.set('X-Telegram-Init-Data', initData);
   if (options.body) headers.set('Content-Type', 'application/json');
-  return fetch(`/api${path}`, { ...options, headers, cache: 'no-store' });
+  return fetch(`/api${path}`, { cache: 'no-store', ...options, headers });
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -112,7 +187,10 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   if (!response.ok) {
     const detail = payload?.detail;
     const message = typeof detail === 'string' ? detail : detail?.message;
-    throw new ApiError(response.status, message || 'Не удалось связаться с ReStore. Попробуйте ещё раз.', detail?.botUrl);
+    const error = new ApiError(response.status, message || 'Не удалось связаться с ReStore. Попробуйте ещё раз.',
+      detail?.botUrl, detail?.expired === true);
+    if (response.status === 401) window.dispatchEvent(new CustomEvent(unauthorizedEvent, { detail: error }));
+    throw error;
   }
   return payload as T;
 }

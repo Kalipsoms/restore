@@ -2,14 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { api, ApiError, money, statusLabel, telegram } from './api-client';
+import { api, ApiError, money, onUnauthorized, statusLabel, telegram } from './api-client';
 import type { Bootstrap, CatalogApp, Order } from './api-client';
 import { CatalogIcon } from './catalog-icon';
 import { ExternalLink } from './external-link';
 import { Brand, Icon } from './icons';
 import type { IconName } from './icons';
 import { Checkout } from './order';
-import { LaunchScreen, useTelegramSettled } from './telegram-runtime';
+import { LaunchScreen, useTelegramBack, useTelegramSettled } from './telegram-runtime';
 
 type Tab = 'catalog' | 'faq' | 'profile';
 
@@ -145,7 +145,7 @@ function Profile({ data, openOrder }: { data: Bootstrap; openOrder: (order: Orde
       {notice && <p className="message" role="status">{notice}</p>}
     </section>
     <section className="panel history-card" aria-labelledby="history-title">
-      <h2 id="history-title"><button type="button" className="history-toggle" aria-expanded={history} aria-controls="profile-orders" onClick={() => setHistory(value => !value)}><Icon name="history" size={22}/>История установок<Icon name="down" size={18}/></button></h2>
+      <h2 id="history-title"><button type="button" className="history-toggle" aria-expanded={history} aria-controls="profile-orders" onClick={() => setHistory(value => !value)}><Icon name="history" size={22}/>Мои заказы<Icon name="down" size={18}/></button></h2>
       <div id="profile-orders" className="disclosure" data-open={history} inert={!history}><div>{data.orders.length ? <div className="orders-list">{data.orders.map(order => <button type="button" className="history-order" key={order.id} onClick={() => openOrder(order)}>
         <span><strong>{order.title}</strong><small>{order.number} · {new Intl.DateTimeFormat('ru-RU', { dateStyle: 'medium' }).format(new Date(order.createdAt))}</small></span>
         <span className="order-tag" data-status={order.status}>{statusLabel[order.status]}</span><Icon name="chevron" size={16}/>
@@ -162,7 +162,7 @@ export function MiniApp() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [tab, setTab] = useState<Tab>('catalog');
-  const pendingCryptoRequests = useRef(new Map<number, string>());
+  const pendingRequests = useRef(new Map<string, string>());
   const [checkout, setCheckout] = useState<{ app?: CatalogApp; order?: Order } | null>(null);
 
   const refresh = useCallback(async () => {
@@ -178,6 +178,13 @@ export function MiniApp() {
   }, [refresh]);
 
   useEffect(() => { if (telegramSettled) load(); }, [load, telegramSettled]);
+  // An expired Telegram session cannot be renewed in place, so every screen gives way to the notice.
+  useEffect(() => onUnauthorized(reason => {
+    setCheckout(null);
+    setData(null);
+    setError(reason);
+  }), []);
+  useTelegramBack(!!data && tab !== 'catalog', () => navigate('catalog'));
 
   function navigate(next: Tab) {
     if (next === tab) return;
@@ -208,12 +215,13 @@ export function MiniApp() {
       <div className="view-panel" data-active={tab === 'faq'} inert={tab !== 'faq'}><Faq data={data}/></div>
       <div className="view-panel" data-active={tab === 'profile'} inert={tab !== 'profile'}><Profile data={data} openOrder={order => setCheckout({ order })}/></div>
     </main>
+    <div className="nav-fade" aria-hidden="true"/>
     <nav className="bottom-nav" data-page={tab} aria-label="Основная навигация">
       <span className="nav-slider" aria-hidden="true"/>
       {tabs.map(item => <button type="button" key={item.id} aria-label={item.title} aria-current={tab === item.id ? 'page' : undefined} onClick={() => navigate(item.id)}>
         <Icon name={item.icon} size={22}/>
       </button>)}
     </nav>
-    {checkout && <Checkout data={data} app={checkout.app} initialOrder={checkout.order} pendingCryptoRequests={pendingCryptoRequests.current} refresh={refresh} close={() => setCheckout(null)}/>}
+    {checkout && <Checkout data={data} app={checkout.app} initialOrder={checkout.order} pendingRequests={pendingRequests.current} refresh={refresh} close={() => setCheckout(null)}/>}
   </div>;
 }

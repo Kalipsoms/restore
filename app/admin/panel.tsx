@@ -2,12 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { api, expandDesktopAdmin, money, statusLabel } from '../api-client';
+import { useRouter } from 'next/navigation';
+import { api, expandDesktopAdmin, money, onUnauthorized, statusLabel } from '../api-client';
 import type { CatalogApp, Order } from '../api-client';
 import { CatalogIcon } from '../catalog-icon';
 import { Brand, Icon } from '../icons';
 import type { IconName } from '../icons';
-import { LaunchScreen, useTelegramSettled } from '../telegram-runtime';
+import { LaunchScreen, useTelegramBack, useTelegramSettled } from '../telegram-runtime';
 import { Dashboard } from './dashboard';
 import { AppEditor, readImage, ReferralEditor } from './editors';
 import type { AppDraft } from './editors';
@@ -39,6 +40,17 @@ export function Admin() {
   const [orderCursors, setOrderCursors] = useState<number[]>([]);
   const [ordersVersion, setOrdersVersion] = useState(0);
   const authorized = data !== null;
+  const router = useRouter();
+
+  useEffect(() => onUnauthorized(reason => {
+    setData(null);
+    setError(reason);
+  }), []);
+  useTelegramBack(true, () => {
+    if (busy) return;
+    if (editing) setEditing(null);
+    else router.push('/');
+  });
 
   useEffect(() => {
     if (page !== 'orders' || !authorized) return;
