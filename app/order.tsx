@@ -7,6 +7,7 @@ import { CatalogIcon } from './catalog-icon';
 import { ExternalLink } from './external-link';
 import { Icon } from './icons';
 import type { IconName } from './icons';
+import { useCloseProtection, useTelegramBack } from './telegram-runtime';
 
 const methodList: { key: Method; icon: IconName; title: string; disabledText: string }[] = [
   { key: 'balance', icon: 'wallet', title: 'Бонусный баланс', disabledText: 'Недоступно' },
@@ -14,7 +15,9 @@ const methodList: { key: Method; icon: IconName; title: string; disabledText: st
   { key: 'sbp', icon: 'sbp', title: 'СБП', disabledText: 'Недоступно' },
 ];
 
-function saveCryptoRequest(key: string, requestId: string | null) {
+// The request id is the idempotency key of an order. It is kept until the server gives a final
+// answer, so a retry after a lost response returns the same order instead of charging twice.
+function saveRequest(key: string, requestId: string | null) {
   try {
     if (requestId) sessionStorage.setItem(key, requestId);
     else sessionStorage.removeItem(key);
@@ -23,21 +26,25 @@ function saveCryptoRequest(key: string, requestId: string | null) {
   }
 }
 
-export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refresh, close }: {
-  data: Bootstrap; app?: CatalogApp; initialOrder?: Order; pendingCryptoRequests: Map<number, string>;
+export function Checkout({ data, app, initialOrder, pendingRequests, refresh, close }: {
+  data: Bootstrap; app?: CatalogApp; initialOrder?: Order; pendingRequests: Map<string, string>;
   refresh: () => Promise<Bootstrap>; close: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef('');
   const [showMethods, setShowMethods] = useState(false);
   const [closing, setClosing] = useState(false);
-  const [method, setMethod] = useState<Method | null>(null);
+  const amount = app?.price ?? 0;
+  const available = (key: Method) => data.methods[key] && (key !== 'balance' || data.balance >= amount);
+  const [method, setMethod] = useState<Method | null>(() => {
+    const usable = methodList.filter(item => available(item.key));
+    return usable.length === 1 ? usable[0].key : null;
+  });
   const [order, setOrder] = useState(initialOrder);
   const [busy, setBusy] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const amount = app?.price ?? 0;
   const settled = order?.status === 'paid' || order?.status === 'installed';
   const pending = order?.status === 'pending' || order?.status === 'verifying';
   const orderId = order?.id;
@@ -98,6 +105,20 @@ export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refre
     } finally { setVerifying(false); }
   }, [orderId, updateOrder]);
 
+  function dismiss() {
+    if (!busy) setClosing(true);
+  }
+
+  useTelegramBack(true, () => {
+    if (busy) return;
+    if (showMethods && !order) {
+      setShowMethods(false);
+      setError('');
+    } else dismiss();
+  });
+  // Closing Telegram in the middle of a payment is confirmed first; the sheet itself cannot be swiped away.
+  useCloseProtection(busy || pending);
+
   function pay() {
     if (order?.paymentUrl) openExternal(order.paymentUrl);
   }
@@ -111,36 +132,35 @@ export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refre
 
   async function submit() {
     if (!app || !method || busy) return;
-    const storageKey = `restore:crypto-request:${data.user.id}:${app.id}`;
+    const requestKey = `${app.id}:${method}`;
+    const storageKey = `restore:order-request:${data.user.id}:${requestKey}`;
+    const forget = () => {
+      pendingRequests.delete(requestKey);
+      saveRequest(storageKey, null);
+      request.current = '';
+    };
     setBusy(true);
     setError('');
     try {
-      if (method === 'crypto') {
-        let saved = pendingCryptoRequests.get(app.id);
-        if (!saved) {
-          try { saved = sessionStorage.getItem(storageKey) ?? undefined; } catch { /* Storage is optional. */ }
-        }
-        request.current = saved ?? crypto.randomUUID();
-        pendingCryptoRequests.set(app.id, request.current);
-        saveCryptoRequest(storageKey, request.current);
-      } else {
-        request.current ||= crypto.randomUUID();
+      let saved = pendingRequests.get(requestKey);
+      if (!saved) {
+        try { saved = sessionStorage.getItem(storageKey) ?? undefined; } catch { /* Storage is optional. */ }
       }
+      request.current = saved ?? crypto.randomUUID();
+      pendingRequests.set(requestKey, request.current);
+      saveRequest(storageKey, request.current);
       const [next] = await Promise.all([
         api<Order>('/orders', { method: 'POST', body: JSON.stringify({ appId: app.id, method, amount,
           requestId: request.current, offerUrl: data.offerUrl }) }),
         new Promise(resolve => setTimeout(resolve, method === 'balance' ? 700 : 200)),
       ]);
-      if (method === 'crypto') {
-        pendingCryptoRequests.delete(app.id);
-        saveCryptoRequest(storageKey, null);
-      }
+      forget();
       setOrder(next);
     } catch (reason) {
-      if (method === 'crypto' && reason instanceof ApiError && reason.status === 409) {
-        pendingCryptoRequests.delete(app.id);
-        saveCryptoRequest(storageKey, null);
-        void refresh().catch(() => {});
+      // A definite refusal means no order is in flight; anything else may still have been accepted.
+      if (reason instanceof ApiError && [403, 409, 422].includes(reason.status)) {
+        forget();
+        if (reason.status === 409) void refresh().catch(() => {});
       }
       setError((reason as Error).message);
     } finally { setBusy(false); }
@@ -148,10 +168,6 @@ export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refre
 
   const title = order ? (settled ? (order.status === 'installed' ? 'Приложение установлено' : 'Заказ успешно оплачен') : statusLabel[order.status])
     : showMethods ? 'Подтверждение заказа' : 'Установка приложения';
-
-  function dismiss() {
-    if (!busy) setClosing(true);
-  }
 
   const stage = order?.status ?? (showMethods ? 'methods' : 'details');
 
@@ -169,6 +185,7 @@ export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refre
       </div>
       {!order && app && <div className="checkout-app"><CatalogIcon url={app.icon}/>
         <div><strong>{app.title}</strong><p>{app.category}</p></div><strong className="price">{money(amount, data.currency)}</strong></div>}
+      {!order && app?.description && !showMethods && <p className="checkout-description">{app.description}</p>}
       <div className="checkout-stage" key={stage}>
       {order ? <>
         <div className="result" aria-live="polite">
@@ -193,7 +210,7 @@ export function Checkout({ data, app, initialOrder, pendingCryptoRequests, refre
         {showMethods ? <>
           <fieldset className="payment-methods"><legend>Способ оплаты</legend>
             {methodList.map(item => {
-              const enabled = data.methods[item.key] && (item.key !== 'balance' || data.balance >= amount);
+              const enabled = available(item.key);
               const description = item.key === 'balance' ? (data.methods.balance ?
                 (enabled ? `Доступно ${money(data.balance, data.currency)}` : `Недостаточно бонусов · ${money(data.balance, data.currency)}`) :
                 item.disabledText) : item.key === 'crypto' ? (enabled ? '2328.io' : '2328.io · недоступно') :

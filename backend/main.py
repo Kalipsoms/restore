@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,7 +14,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from . import config
-from .integrations import Integrations, UpstreamError, update_crypto, valid_crypto_webhook, validate_init_data
+from .integrations import Integrations, UpstreamError, check_init_data, update_crypto, valid_crypto_webhook
+from .ratelimit import RateLimiter
 from .store import Store
 
 log = logging.getLogger('restore')
@@ -32,12 +34,15 @@ async def start_telegram_job(job):
 @asynccontextmanager
 async def lifespan(app):
     store = app.state.store = Store(config.DATABASE_PATH)
-    async with httpx.AsyncClient() as client:
+    app.state.limiter = RateLimiter()
+    async with httpx.AsyncClient(transport=getattr(app.state, 'transport', None)) as client:
         integrations = app.state.integrations = Integrations(client, store)
-        jobs = []
+        background = []
         if config.BOT_TOKEN:
-            jobs = [asyncio.create_task(start_telegram_job(job))
-                    for job in (integrations.poll, integrations.deliver_messages)]
+            background += [integrations.poll, integrations.deliver_messages]
+        if crypto_enabled():
+            background.append(integrations.reconcile_payments)
+        jobs = [asyncio.create_task(start_telegram_job(job)) for job in background]
         try:
             yield
         finally:
@@ -50,18 +55,41 @@ async def lifespan(app):
 app = FastAPI(title='ReStore', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+# (limit, window in seconds) per scope
+LIMITS = {
+    'api': ((300, 60),),
+    'order': ((6, 60), (30, 3600)),
+    'check': ((10, 60),),
+    'webhook': ((120, 60),),
+    'verify': ((1, 30),),
+}
+
+
+def throttle(request, scope, key):
+    for limit, window in LIMITS[scope]:
+        wait = request.app.state.limiter.retry_after((scope, window, key), limit, window)
+        if wait:
+            raise HTTPException(429, f'Слишком много запросов. Повторите через {wait} с.',
+                                headers={'Retry-After': str(wait)})
+
+
 def require_launch(request):
-    result = validate_init_data(request.headers.get('x-telegram-init-data', ''))
+    status, result = check_init_data(request.headers.get('x-telegram-init-data', ''))
     if not result:
+        expired = status == 'expired'
         raise HTTPException(401, {
-            'message': 'Откройте чат с ботом и нажмите «Открыть ReStore».',
+            'message': ('Сессия истекла. Закройте ReStore и откройте его заново из чата с ботом.' if expired
+                        else 'Откройте чат с ботом и нажмите «Открыть ReStore».'),
+            'expired': expired,
             'botUrl': f'https://t.me/{config.BOT_USERNAME}' if config.BOT_USERNAME else '',
         })
     return result
 
 
 def current_user(request):
-    return request.app.state.store.register_user(*require_launch(request))
+    user, referral = require_launch(request)
+    throttle(request, 'api', user['id'])
+    return request.app.state.store.register_user(user, referral)
 
 
 async def admin_only(request: Request):
@@ -163,6 +191,7 @@ class OrderInput(BaseModel):
 @app.post('/api/orders')
 async def start_order(request: Request, body: OrderInput):
     user = current_user(request)
+    throttle(request, 'order', user['id'])
     if reason := checkout_unavailable():
         raise HTTPException(403, reason)
     if body.method == 'sbp' or (body.method == 'crypto' and not crypto_enabled()):
@@ -196,6 +225,7 @@ async def order_status(request: Request, order_id: int):
 @app.post('/api/orders/{order_id}/check')
 async def check_order(request: Request, order_id: int):
     order = own_order(request, order_id)
+    throttle(request, 'check', order['user_id'])
     integrations = request.app.state.integrations
     try:
         if order['method'] == 'crypto' and order['status'] == 'pending' and not order['payment_url']:
@@ -212,13 +242,28 @@ async def check_order(request: Request, order_id: int):
 
 @app.post('/api/webhooks/2328')
 async def crypto_webhook(request: Request):
+    throttle(request, 'webhook', request.client.host if request.client else '')
+    raw = await request.body()
     try:
-        payload = await request.json()
+        payload = json.loads(raw)
     except ValueError:
         raise HTTPException(400, 'Invalid payload') from None
-    if not valid_crypto_webhook(payload):
-        raise HTTPException(401, 'Invalid signature')
-    if not update_crypto(request.app.state.store, payload):
+    store = request.app.state.store
+    if not valid_crypto_webhook(payload, raw, request.headers.get('sign', '')):
+        # The notification is not trusted, but it may still be a real one whose signature
+        # format differs. Ask the provider directly instead of taking the payload on faith.
+        ref = payload.get('order_id') if isinstance(payload, dict) else None
+        order = store.by_ref(ref) if isinstance(ref, str) and crypto_enabled() else None
+        if not order or order['method'] != 'crypto' or order['status'] in ('paid', 'installed'):
+            raise HTTPException(401, 'Invalid signature')
+        throttle(request, 'verify', order['id'])
+        log.warning('Подпись уведомления 2328.io не подтверждена, сверяем заказ %s через API', order['id'])
+        try:
+            await request.app.state.integrations.refresh_crypto(order)
+        except UpstreamError:
+            raise HTTPException(502, 'Payment could not be verified') from None
+        return {'ok': True}
+    if not update_crypto(store, payload):
         log.warning('Получено уведомление 2328.io без подходящего заказа')
         raise HTTPException(409, 'Payment does not match an order')
     return {'ok': True}
@@ -227,12 +272,20 @@ async def crypto_webhook(request: Request):
 @app.get('/api/icons/{app_id}')
 async def icon(request: Request, app_id: int):
     require_launch(request)
-    row = request.app.state.store.one('SELECT icon, icon_type FROM apps WHERE id = ?', app_id)
+    row = request.app.state.store.one('SELECT icon, icon_type, revision FROM apps WHERE id = ?', app_id)
     if not row:
         raise HTTPException(404)
-    return Response(row['icon'], media_type=row['icon_type'], headers={
+    # Catalog links carry the revision, so a matching URL never changes and can be kept by the client.
+    versioned = request.query_params.get('v') == str(row['revision'])
+    etag = f'"{app_id}-{row["revision"]}"'
+    headers = {
         'Content-Security-Policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'",
-    })
+        'Cache-Control': 'private, max-age=31536000, immutable' if versioned else 'private, no-cache',
+        'ETag': etag,
+    }
+    if etag in request.headers.get('if-none-match', ''):
+        return Response(status_code=304, headers=headers)
+    return Response(row['icon'], media_type=row['icon_type'], headers=headers)
 
 
 class AdminApp(BaseModel):

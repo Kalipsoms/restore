@@ -51,10 +51,13 @@ CREATE INDEX IF NOT EXISTS orders_user_recent ON orders(user_id, id DESC);
 CREATE INDEX IF NOT EXISTS orders_paid_at ON orders(paid_at) WHERE paid_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS orders_created_at ON orders(created_at);
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(next_at) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS orders_open_crypto ON orders(id) WHERE method = 'crypto' AND status IN ('pending', 'verifying');
 '''
 
 APP_FIELDS = 'id, title, category, description, price, revision, active'
 REPORT_ZONE = timezone(timedelta(hours=3), 'MSK')
+DUPLICATE_BALANCE_WINDOW = 120
+MAX_OPEN_CRYPTO_ORDERS = 5
 
 
 class Store:
@@ -117,10 +120,15 @@ class Store:
             referrer = None
         name = ' '.join(filter(None, (user.get('first_name'), user.get('last_name')))) or 'Пользователь Telegram'
         photo = config.https_url(user.get('photo_url') or '')
+        username = user.get('username') or ''
+        existing = self.one('SELECT * FROM users WHERE id = ?', user_id)
+        if existing and (existing['name'], existing['username']) == (name, username) and photo in ('', existing['photo']):
+            # Nothing changed: most requests come from known users, so skip the write.
+            return existing
         self.run('''INSERT INTO users VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, username = excluded.username,
                     photo = coalesce(nullif(excluded.photo, ''), users.photo)''',
-                 user_id, name, user.get('username', ''), photo, referrer)
+                 user_id, name, username, photo, referrer)
         return self.one('SELECT * FROM users WHERE id = ?', user_id)
 
     def invited_count(self, user_id):
@@ -165,6 +173,11 @@ class Store:
                              AND (? IS NULL OR orders.id = ?)
                            ORDER BY orders.id DESC LIMIT ?""",
                         status, status, before, before, order_id, order_id, limit)
+
+    def open_crypto_orders(self):
+        return self.all("""SELECT * FROM orders WHERE method = 'crypto' AND status IN ('pending', 'verifying')
+                           AND payment_id IS NOT NULL AND created_at >= datetime('now', '-2 days')
+                           ORDER BY id LIMIT 50""")
 
     def admin_order(self, order_id):
         return self.one('SELECT * FROM orders WHERE id = ?', order_id)
@@ -217,8 +230,16 @@ class Store:
             amount = item['price'] if item else 0
             if not amount or amount != expected_amount:
                 raise ValueError('Цена или наличие изменились. Откройте каталог заново.')
-            if method == 'balance' and self.balance(user_id, currency) < amount:
-                raise ValueError('На балансе недостаточно бонусов.')
+            if method == 'balance':
+                # A retry that lost its request id must not spend the bonuses twice.
+                if self.one("""SELECT id FROM orders WHERE user_id = ? AND app_id = ? AND method = 'balance'
+                               AND created_at >= datetime('now', ?)""", user_id, app_id, f'-{DUPLICATE_BALANCE_WINDOW} seconds'):
+                    raise ValueError('Этот заказ уже оплачен бонусами. Проверьте историю заказов.')
+                if self.balance(user_id, currency) < amount:
+                    raise ValueError('На балансе недостаточно бонусов.')
+            elif self.one("""SELECT count(*) FROM orders WHERE user_id = ? AND method = 'crypto' AND status = 'pending'
+                             AND created_at >= datetime('now', '-1 day')""", user_id)[0] >= MAX_OPEN_CRYPTO_ORDERS:
+                raise ValueError('У вас уже есть неоплаченные заказы. Оплатите их или дождитесь истечения счетов.')
             order_id = self.run('''INSERT INTO orders (user_id, app_id, request_id, ref, title, amount, currency,
                                    method, referral_percent, offer_url)
                                    SELECT ?, id, ?, ?, title, ?, ?, ?, ?, ? FROM apps WHERE id = ?''',
